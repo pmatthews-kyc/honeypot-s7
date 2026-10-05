@@ -1,0 +1,40 @@
+# honeypot-s7 — Python dependencies
+#
+# Recommended install: deploy/install.sh, which creates an isolated virtualenv
+# and handles both the apt and pip packages correctly. This file documents the
+# dependencies for manual/advanced installs.
+#
+# ── System packages (apt) — install these FIRST ────────────────────────────
+#   sudo apt install -y python3 python3-pip python3-venv python-is-python3 \
+#       python3-yaml python3-netfilterqueue build-essential \
+#       tshark macchanger iptables iproute2 net-tools curl git
+#
+#   python3-netfilterqueue is installed via apt (precompiled). Do NOT rely on
+#   the pip build below unless you have libnfnetlink-dev + build-essential and
+#   a reason to — the apt package is what install.sh uses.
+#
+# ── Python packages (pip, into a virtualenv) ───────────────────────────────
+#   python3 -m venv --system-site-packages venv
+#   venv/bin/pip install -r requirements.txt
+#
+# --system-site-packages lets the venv see the apt-installed netfilterqueue
+# without recompiling, while keeping these pip installs isolated from the
+# system Python (which modern Debian, PEP 668, protects).
+#
+# Minimum Python: 3.9 (PEP 604 `X | None`, PEP 585 `list[...]` generics).
+
+python-snap7>=3.0.0    # pure-Python S7 server; confirmed against 3.1.2
+PyYAML>=6.0            # config parsing
+
+# Optional — only when the OpenPLC bridge is enabled (x-modbus-bridge: true):
+pymodbus>=3.0.0
+
+# Provided by apt as python3-netfilterqueue (preferred). Listed for
+# completeness; pip-building needs libnfnetlink-dev + build-essential:
+#   NetfilterQueue>=1.1
+
+# Test dependency (optional — the suite also runs standalone with
+# `for t in tests/test_*.py; do python3 $t; done`). install.sh does not
+# install pytest into the runtime venv; add it only in a dev environment:
+#   venv/bin/pip install pytest
+pytest>=7.0

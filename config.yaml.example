@@ -1,0 +1,788 @@
+# S7 Honeypot — Configuration
+# ══════════════════════════════════════════════════════════════════
+#
+#   QUICK SETUP  ─  the only values you need to change for a new
+#   deployment are in this block. Everything else is pre-configured.
+#
+# ══════════════════════════════════════════════════════════════════
+
+# Network interface the honeypot listens on.
+# Run `ip a` to confirm the name on your device (eth0, enp3s0, etc.).
+# This single value drives tshark capture, MAC spoofing, and the
+# fingerprint hardening script via YAML anchors (*interface below).
+x-interface: &interface "ens33"
+
+# Where ALL capture data is written (pcaps + JSONL command log).
+# Point this at your mounted removable drive. To override without
+# editing this file: export S7HONEYPOT_DATA_DIR=/your/path
+x-data-dir: &data_dir "/mnt/s7honeypot-data"
+
+# Confirm the removable drive is actually mounted before writing.
+# Prevents silently filling the SD card when the drive is missing.
+# Set false only for local testing on a plain directory.
+x-require-mount: &require_mount true
+
+# Siemens AG OUI for MAC spoofing. All three are confirmed OUIs
+# registered to Siemens' Amberg plant (actual SIMATIC S7 factory):
+#   28:63:36  (default)
+#   AC:64:17
+#   88:3F:99
+x-siemens-oui: &siemens_oui "28:63:36"
+
+# IP TTL the honeypot presents. A real Siemens S7-300 uses an initial TTL
+# of 30 — a distinctive value (not Linux's 64, Windows' 128, or network
+# gear's 255). fingerprint_harden.sh rewrites outbound TTL to this so a
+# `ping` or nmap -O sees the S7-300 value rather than the host Linux 64.
+# Only change this if you are emulating a different device with a known TTL.
+x-target-ttl: &target_ttl 30
+
+# Persistent diagnostic event log (STOP/START commands, mode transitions).
+# Survives reboots so the web portal diagnostic buffer shows the full
+# operator history. Change to a path on your removable drive if you want
+# the event history to persist across SD card reflashes.
+x-diag-events: &diag_events "/var/lib/s7honeypot/diag_events.jsonl"
+
+# Runtime state directory. All the small state files the services share
+# (cpu_state.json, network_state.json, process_state.json, mac_spoof_state.json)
+# live here. Point this and x-honeypot-db at the same persistent location —
+# a directory that survives reboot and is shared between all services (NOT
+# /tmp, which systemd PrivateTmp makes per-service). Change this ONE value
+# to relocate all runtime state.
+x-state-dir: &state_dir "/var/lib/s7honeypot"
+
+# SQLite database for diagnostic events (web portal diagnostic buffer).
+# Stores process events (pump cycles, alarms), S7 client reads showing
+# the Modbus values seen by each client, and STOP/START mode transitions.
+# Change to a path on your removable drive so event history persists
+# across SD card reflashes alongside the JSONL command log.
+x-honeypot-db: &honeypot_db "/var/lib/s7honeypot/honeypot.db"
+
+# ── OpenPLC process engine ─────────────────────────────────────────
+#
+# When x-openplc is true, OpenPLC runs in Docker executing a real
+# IEC 61131-3 Structured Text program that drives realistic process
+# values (temperature, flow, pressure, level with proper control logic).
+# Modbus TCP (port 502) is bound to 127.0.0.1 only — never visible on
+# the external NIC, so there is no same-IP dual-protocol tell.
+#
+# To enable:
+#   1. Run:  ./install_openplc.sh
+#      (installs Docker, builds OpenPLC image, uploads the program)
+#   2. Set both flags below to true
+#   3. Restart the honeypot services
+#
+# Leave both false to use the built-in process_simulator (default).
+# Both flags must be changed together.
+x-openplc:        &openplc_enabled        false
+x-modbus-bridge:  &modbus_bridge_enabled  false
+
+# Listening ports (all need root or CAP_NET_BIND_SERVICE below 1024)
+x-port-s7:   &s7_port   102
+x-port-snmp: &snmp_port 161
+x-port-web:  &web_port  80
+
+
+# ══════════════════════════════════════════════════════════════════
+#   DEVICE IDENTITY  ─  what this honeypot claims to be
+#   Change these to impersonate a different S7 device class.
+# ══════════════════════════════════════════════════════════════════
+
+identity:
+  # CPU order code shown in SZL 0x0011 (Basic Hardware / Module)
+  # and returned by nmap --script s7-info as "Basic Hardware:".
+  order_code: "6ES7 315-2AG10-0AB0"
+
+  # 4-character firmware version for SZL 0x0011's wire format.
+  # Confirmed: this field is exactly 4 bytes in the real library.
+  firmware_version: "V2.6"
+
+  # Numeric version bytes shown by nmap as "Version: X.Y.Z".
+  firmware_version_parts: [2, 6, 0]
+
+  # Serial number. IMPORTANT: change this before deploying. If every copy
+  # of this honeypot ships the same serial, that shared value becomes a
+  # fingerprint identifying the deployment AS this honeypot. Generate a
+  # plausible-format serial unique to your deployment. Format below is the
+  # Siemens style (letters, spaces, alphanumerics) but is not a real unit.
+  serial_number: "S C-XXXXXXXXXXXX"
+
+  # Rack and slot where the CPU lives -- used to validate incoming COTP
+  # TSAPs. A real S7-300 sends COTP DR (Disconnect Request) for
+  # connections targeting the wrong rack/slot. snap7.Server accepts any
+  # TSAP; the proxy enforces this check using these values.
+  # S7-300: CPU always in slot 2, rack 0.  S7-400: typically slot 4.
+  rack: 0
+  slot: 2
+
+  # PLC name shown in SZL 0x001C record 1 (ASName / System Name).
+  plc_name: "SIMATIC 300(1)"
+
+  # CPU type string shown in SZL 0x001C record 2 (Module Name).
+  module_name: "CPU 315-2 PN/DP"
+
+  copyright: "Original Siemens Equipment"
+  plant_id: ""
+  module_type_name: "CPU 315-2 PN/DP"
+
+  # Negotiated maximum PDU size, in bytes. Real S7 hardware uses one of a
+  # few fixed values: 240 (smaller/older S7-300 CPUs), 480 (CPU 315-2 PN/DP
+  # and similar), or 960. This value MUST be one of those — a non-standard
+  # size is itself a fingerprint. It is enforced consistently in three
+  # places: the connection-setup PDU-negotiation ACK (patched at the proxy,
+  # since snap7 advertises 960), SZL 0x0131 (communication capability), and
+  # the SZL 0x00A0 diagnostic-buffer response, which is capped to fit within
+  # this PDU. Change it here and all three follow.
+  max_pdu: 240
+
+
+# ══════════════════════════════════════════════════════════════════
+#   STORAGE AND CAPTURE
+# ══════════════════════════════════════════════════════════════════
+
+storage:
+  data_dir: *data_dir        # ← set at top of file
+  require_mount: *require_mount
+
+capture:
+  enabled: true
+  interface: *interface      # ← set at top of file
+  pcap_dir: "${DATA_DIR}/pcap"
+  # Require a valid TPKT+COTP Connection Request before treating a
+  # connection as real S7comm -- filters generic port-scan noise.
+  require_valid_cotp: true
+  max_session_seconds: 900
+  max_session_bytes: 52428800   # 50 MB per session pcap
+
+logging:
+  state_dir:         *state_dir
+  jsonl_path:        "${DATA_DIR}/commands.jsonl"
+  diag_events_path:  *diag_events
+  honeypot_db:       *honeypot_db
+  log_level: "INFO"
+
+
+# ══════════════════════════════════════════════════════════════════
+#   NETWORK AND FINGERPRINTING
+# ══════════════════════════════════════════════════════════════════
+
+network:
+  host: "0.0.0.0"
+  port: *s7_port             # ← set at top of file
+  max_clients: 32
+
+mac_spoofing:
+  enabled: true
+  interface: *interface      # ← set at top of file
+  target_oui: *siemens_oui  # ← set at top of file
+
+
+# ══════════════════════════════════════════════════════════════════
+#   PROTOCOLS
+# ══════════════════════════════════════════════════════════════════
+
+snmp:
+  enabled: true
+  community: "public"
+  listen_host: "0.0.0.0"
+  listen_port: *snmp_port    # ← set at top of file
+
+  # sys_name and sys_descr are now derived automatically from [identity]
+  # (plc_name, module_name, order_code, firmware_version) so changing
+  # those fields propagates consistently to SNMP, S7comm SZL, and the
+  # web portal without editing multiple places.  Uncomment either line
+  # to override the derived value if your SNMP monitor expects something
+  # different from what the S7comm surfaces report.
+  #sys_name: ""
+  #sys_descr: ""
+
+  # sys_object_id: Siemens enterprise prefix is 1.3.6.1.4.1.4196.
+  # The product-specific suffix is not confirmed -- source from a
+  # real device capture before relying on this for strict fidelity.
+  sys_object_id: "1.3.6.1.4.1.4196"
+
+  sys_contact: ""
+  sys_location: ""
+  sys_services: 79
+
+web_portal:
+  enabled: true
+  listen_host: "0.0.0.0"
+  listen_port: *web_port     # ← set at top of file
+
+  # false = read-only diagnostics page (closer fidelity to bare S7-300).
+  # true  = adds a login form that captures submitted credentials but
+  #         never grants access (credential-capture value vs. fidelity
+  #         trade-off -- see README).
+  require_login: false
+
+  # HTTP Server header. Leave blank to omit entirely (many embedded
+  # servers send nothing here, which is itself realistic). Fill in a
+  # value sourced from a real device capture if you have one.
+  server_header: "SIMATIC CP HTTP Server"
+
+  diagnostic_buffer_lines:
+    - "Mode transition from STARTUP to RUN"
+    - "PROFINET IO device established"
+    - "Backed-up data saved"
+
+  noise_filter:
+    generic_scanner_path_substrings:
+      - "wp-admin"
+      - "wp-login"
+      - "xmlrpc.php"
+      - ".env"
+      - "phpmyadmin"
+      - ".git/"
+      - "cgi-bin"
+      - "/actuator"
+      - "/.aws"
+      - "/wp-content"
+      - "shell.php"
+      - "/console"
+    generic_scanner_user_agent_substrings:
+      - "zgrab"
+      - "masscan"
+      - "python-requests"
+      - "Go-http-client"
+      - "curl/"
+
+
+# ══════════════════════════════════════════════════════════════════
+#   ADVANCED  ─  rarely need changing
+# ══════════════════════════════════════════════════════════════════
+
+ladder_program:
+  enabled: true
+  # Disabled by default: nmap's s7-info.nse queries SZL 0x0424 as
+  # part of its own identification sequence and the fabricated response
+  # structure is not yet verified against a real capture. Leave false
+  # until verified; enabling currently breaks nmap's s7-info output.
+  szl_status_intercept_enabled: false
+
+process_values:
+  enabled: true
+  interval_seconds: 2.0
+
+  # ── OpenPLC data-acquisition watchdog ──────────────────────────────
+  # Only active when x-openplc / x-modbus-bridge is true (the bridge is the
+  # data source that can fail). In default simulator mode this is dormant —
+  # the simulator generates values itself and has nothing to lose comms with.
+  #
+  # When the bridge stops delivering fresh data for longer than
+  # fault_threshold_seconds, process values FREEZE at their last-known
+  # state on both surfaces (S7comm DB reads and the web portal agree), a
+  # single diagnostic-buffer event is raised, and the portal shows a
+  # warning banner. On recovery, a matching "restored" event is raised and
+  # the banner clears. This mirrors how a real S7-300 reports an internal
+  # process-data fault — plant-agnostic wording, so no rack/slot/IP tells.
+  watchdog:
+    fault_threshold_seconds: 60
+    fault_event:   "Process data acquisition fault"
+    restore_event: "Process data acquisition restored"
+
+  tags:
+    # ── DB1 (tank/pump simulation, internal) ──────────────────────
+    - name: "tank_level"
+      db_number: 1
+      offset: 0
+      pack_format: "real"
+      min: 10.0
+      max: 90.0
+      max_step: 0.8
+      setpoint: 55.0
+      setpoint_gravity: 0.03
+      event_chance: 0.02
+      event_multiplier: 5.0
+      influenced_by:
+        - source: "flow_rate"
+          reference: 12.0
+          coefficient: 0.03
+
+    - name: "pressure"
+      db_number: 1
+      offset: 4
+      pack_format: "real"
+      min: 1.0
+      max: 6.0
+      max_step: 0.12
+      setpoint: 3.2
+      setpoint_gravity: 0.04
+      event_chance: 0.01
+      event_multiplier: 4.0
+      influenced_by:
+        - source: "tank_level"
+          reference: 55.0
+          coefficient: 0.01
+
+    - name: "flow_rate"
+      db_number: 1
+      offset: 8
+      pack_format: "real"
+      min: 0.0
+      max: 25.0
+      max_step: 1.0
+      setpoint: null
+      event_chance: 0.03
+      event_multiplier: 3.0
+
+    # ── DB500 (matches S7ClientTests.cs exact addresses/types) ────
+    # DBB0=byte, DBB5-7=byte[3], DBX8=bool, DBW10/14/16=int,
+    # DBD18/22=dint, DBD26/30=real. Min 34 bytes, allocated as 256.
+    - name: "db500_status_byte"
+      db_number: 500
+      offset: 0
+      pack_format: "byte"
+      min: 0.0
+      max: 255.0
+      max_step: 3.0
+      setpoint: 128.0
+      setpoint_gravity: 0.01
+
+    - name: "db500_bytes_5_6_7"
+      db_number: 500
+      offset: 5
+      pack_format: "byte"
+      min: 0.0
+      max: 255.0
+      max_step: 5.0
+      setpoint: 128.0
+      setpoint_gravity: 0.01
+
+    - name: "db500_bool_flags"
+      db_number: 500
+      offset: 8
+      pack_format: "bool"
+      min: 0.0
+      max: 1.0
+      max_step: 0.0
+      setpoint: 0.0
+      event_chance: 0.05
+      event_multiplier: 2.0
+
+    - name: "db500_int_10"
+      db_number: 500
+      offset: 10
+      pack_format: "int"
+      min: -32768.0
+      max: 32767.0
+      max_step: 50.0
+      setpoint: 1500.0
+      setpoint_gravity: 0.02
+
+    - name: "db500_int_14"
+      db_number: 500
+      offset: 14
+      pack_format: "int"
+      min: -32768.0
+      max: 32767.0
+      max_step: 50.0
+      setpoint: -500.0
+      setpoint_gravity: 0.02
+
+    - name: "db500_int_16"
+      db_number: 500
+      offset: 16
+      pack_format: "int"
+      min: -32768.0
+      max: 32767.0
+      max_step: 100.0
+      setpoint: 2500.0
+      setpoint_gravity: 0.02
+
+    - name: "db500_dint_18"
+      db_number: 500
+      offset: 18
+      pack_format: "dint"
+      min: -2000000.0
+      max: 2000000.0
+      max_step: 5000.0
+      setpoint: 500000.0
+      setpoint_gravity: 0.01
+
+    - name: "db500_dint_22"
+      db_number: 500
+      offset: 22
+      pack_format: "dint"
+      min: -2000000.0
+      max: 2000000.0
+      max_step: 5000.0
+      setpoint: -250000.0
+      setpoint_gravity: 0.01
+
+    - name: "db500_real_26"
+      db_number: 500
+      offset: 26
+      pack_format: "real"
+      min: -999.0
+      max: 9999.0
+      max_step: 2.5
+      setpoint: 1234.5
+      setpoint_gravity: 0.03
+
+    - name: "db500_real_30"
+      db_number: 500
+      offset: 30
+      pack_format: "real"
+      min: 0.0
+      max: 5000.0
+      max_step: 10.0
+      setpoint: 2500.0
+      setpoint_gravity: 0.02
+
+    # ── DB501 (same structure as DB500, independent values) ────────
+    - name: "db501_status_byte"
+      db_number: 501
+      offset: 0
+      pack_format: "byte"
+      min: 0.0
+      max: 255.0
+      max_step: 3.0
+      setpoint: 64.0
+      setpoint_gravity: 0.01
+
+    - name: "db501_bytes_5_6_7"
+      db_number: 501
+      offset: 5
+      pack_format: "byte"
+      min: 0.0
+      max: 255.0
+      max_step: 5.0
+      setpoint: 192.0
+      setpoint_gravity: 0.01
+
+    - name: "db501_bool_flags"
+      db_number: 501
+      offset: 8
+      pack_format: "bool"
+      min: 0.0
+      max: 1.0
+      max_step: 0.0
+      setpoint: 1.0
+      event_chance: 0.04
+      event_multiplier: 2.0
+
+    - name: "db501_int_10"
+      db_number: 501
+      offset: 10
+      pack_format: "int"
+      min: -32768.0
+      max: 32767.0
+      max_step: 75.0
+      setpoint: -1000.0
+      setpoint_gravity: 0.02
+
+    - name: "db501_int_14"
+      db_number: 501
+      offset: 14
+      pack_format: "int"
+      min: -32768.0
+      max: 32767.0
+      max_step: 60.0
+      setpoint: 3000.0
+      setpoint_gravity: 0.02
+
+    - name: "db501_int_16"
+      db_number: 501
+      offset: 16
+      pack_format: "int"
+      min: -32768.0
+      max: 32767.0
+      max_step: 80.0
+      setpoint: 750.0
+      setpoint_gravity: 0.02
+
+    - name: "db501_dint_18"
+      db_number: 501
+      offset: 18
+      pack_format: "dint"
+      min: -2000000.0
+      max: 2000000.0
+      max_step: 7500.0
+      setpoint: -100000.0
+      setpoint_gravity: 0.01
+
+    - name: "db501_dint_22"
+      db_number: 501
+      offset: 22
+      pack_format: "dint"
+      min: -2000000.0
+      max: 2000000.0
+      max_step: 4000.0
+      setpoint: 800000.0
+      setpoint_gravity: 0.01
+
+    - name: "db501_real_26"
+      db_number: 501
+      offset: 26
+      pack_format: "real"
+      min: -500.0
+      max: 500.0
+      max_step: 1.5
+      setpoint: 42.0
+      setpoint_gravity: 0.03
+
+    - name: "db501_real_30"
+      db_number: 501
+      offset: 30
+      pack_format: "real"
+      min: 0.0
+      max: 1000.0
+      max_step: 5.0
+      setpoint: 333.3
+      setpoint_gravity: 0.02
+
+
+# ══════════════════════════════════════════════════════════════════
+# OpenPLC Modbus bridge (optional)
+# ══════════════════════════════════════════════════════════════════
+#
+# When enabled, a background thread polls OpenPLC's Modbus TCP
+# interface and writes the values into snap7 memory_areas, overriding
+# the process_simulator random-walk values for mapped addresses.
+# Everything not mapped here continues to use process_simulator.
+#
+# Prerequisites:
+#   pip3 install pymodbus --break-system-packages
+#   OpenPLC Runtime running with Modbus TCP enabled on the configured port
+#
+# OpenPLC variable → Modbus register mapping (default for OpenPLC Runtime):
+#   %IX0.0–%IX127.7   → discrete input  coils     1–1024
+#   %QX0.0–%QX127.7   → coil outputs               1–1024
+#   %IW0–%IW1023       → input registers             1–1024
+#   %QW0–%QW1023       → holding registers            1–1024
+#   %MD0–%MD1023       → holding registers 1025–2048 (32-bit, two regs each)
+#
+# register_map entry fields:
+#   modbus_address   Modbus register address (0-indexed)
+#   type             "holding" | "input" | "coil" | "discrete"
+#   area             S7 destination area: "DB" | "I" | "Q" | "M"
+#   db_number        DB number (only used when area="DB")
+#   offset           Byte offset within the area
+#   pack_format      "real" | "int" | "word" | "byte" | "bool"
+#   scale            Optional multiplier applied to raw register value
+#
+openplc:
+  enabled: false
+
+  host: "127.0.0.1"   # OpenPLC Modbus TCP address (loopback if co-located)
+  port: 502
+  poll_interval_seconds: 2.0
+
+  # Default register map mirrors the process_simulator.py built-in tags
+  # so values flow seamlessly from a real OpenPLC program into S7 reads.
+  # Edit to match your OpenPLC program's variable layout.
+  register_map:
+
+    # ── Process measurements (DB 200, REALs) ─────────────────────
+    # Map to OpenPLC %MD variables (32-bit IEEE 754 floats)
+    # OpenPLC packs %MD0 into holding registers 1025-1026 (0-indexed 1024-1025)
+    - modbus_address: 1024   # %MD0 → temperature °C
+      type: holding
+      area: DB
+      db_number: 200
+      offset: 0
+      pack_format: real
+
+    - modbus_address: 1026   # %MD1 → flow l/min
+      type: holding
+      area: DB
+      db_number: 200
+      offset: 4
+      pack_format: real
+
+    - modbus_address: 1028   # %MD2 → pressure bar
+      type: holding
+      area: DB
+      db_number: 200
+      offset: 8
+      pack_format: real
+
+    - modbus_address: 1030   # %MD3 → tank level %
+      type: holding
+      area: DB
+      db_number: 200
+      offset: 12
+      pack_format: real
+
+    # ── Digital outputs → S7 Q area ──────────────────────────────
+    # OpenPLC %QX0.0–7 maps to coil output byte 0
+    - modbus_address: 0      # %QX0.0 → QB0 (packed as a byte)
+      type: coil
+      area: Q
+      offset: 0
+      pack_format: bool
+      bit: 0
+
+    - modbus_address: 1      # %QX0.1
+      type: coil
+      area: Q
+      offset: 0
+      pack_format: bool
+      bit: 1
+
+    - modbus_address: 2      # %QX0.2
+      type: coil
+      area: Q
+      offset: 0
+      pack_format: bool
+      bit: 2
+
+    - modbus_address: 3      # %QX0.3
+      type: coil
+      area: Q
+      offset: 0
+      pack_format: bool
+      bit: 3
+
+    # ── Digital inputs → S7 I area ───────────────────────────────
+    - modbus_address: 0      # %IX0.0 → IB0
+      type: discrete
+      area: I
+      offset: 0
+      pack_format: bool
+      bit: 0
+
+    - modbus_address: 1      # %IX0.1
+      type: discrete
+      area: I
+      offset: 0
+      pack_format: bool
+      bit: 1
+
+    - modbus_address: 2      # %IX0.2
+      type: discrete
+      area: I
+      offset: 0
+      pack_format: bool
+      bit: 2
+
+    # ── Analog speed reference (DB 121, WORD) ────────────────────
+    - modbus_address: 0      # %QW0 → speed setpoint (0-27648)
+      type: holding
+      area: DB
+      db_number: 121
+      offset: 0
+      pack_format: word
+
+
+# ── OpenPLC Modbus Bridge ─────────────────────────────────────────────────────
+# Only active when x-modbus-bridge is true (top of file).
+#
+# ── OpenPLC v3 Modbus Register Map (confirmed from source) ──────────────────
+# OpenPLC v3 (thiagoralves/OpenPLC_v3) Linux generic hardware layer:
+#   Coils  (FC1/FC5):   %QX0.0 → coil 0          → Q area bits
+#   DI     (FC2):       %IX0.0 → discrete input 0 → I area bits
+#   Holding regs (FC3): %QW0   → HR 0             → process values
+#                       %QW1   → HR 1              (one INT per HR)
+#   Input regs  (FC4):  %IW0   → IR 0             → input words
+#
+# The process_sim.st program stores all values in %QW registers as
+# scaled integers (×10 or ×100) to avoid float handling in IEC 61131-3.
+# The mapping below scales them back to floats for snap7/S7comm.
+#
+# OpenPLC v3 is run via Docker with ports bound to 127.0.0.1 only:
+#   docker-compose.yml binds: -p 127.0.0.1:502:502
+#   External network sees NO port 502. Only this modbus_bridge on
+#   localhost can reach the Modbus server.
+#
+modbus_bridge:
+  enabled:       *modbus_bridge_enabled  # ← set x-modbus-bridge: true at top
+  host:          127.0.0.1             # loopback only — Docker port binding
+  port:          502
+  poll_interval: 0.5                     # 500ms: smooth updates, no 2s jumps
+  unit_id:       1
+
+  # s7_format values:
+  #   real_x10   divide INT by 10.0, pack as big-endian IEEE-754 float
+  #   real_x100  divide INT by 100.0, pack as big-endian IEEE-754 float
+  #   word       pack 16-bit unsigned big-endian
+  #   byte       low byte of register
+  #   bits_to_byte  combine 8 coil bits into one byte
+  #
+  mapping:
+    # Process measurements from process_sim.st ─────────────────────────
+    # %QW0 → HR 0 → temperature × 10 → DB200.DBD0 REAL
+    - modbus_type: holding
+      modbus_start: 0
+      count: 1
+      s7_area: DB
+      s7_db: 200
+      s7_offset: 0
+      s7_format: real_x10      # 750 → 75.0°C
+      tag_name: db200_temperature
+
+    # %QW1 → HR 1 → flow × 10 → DB200.DBD4 REAL
+    - modbus_type: holding
+      modbus_start: 1
+      count: 1
+      s7_area: DB
+      s7_db: 200
+      s7_offset: 4
+      s7_format: real_x10      # 1200 → 120.0 l/min
+      tag_name: db200_flow
+
+    # %QW2 → HR 2 → pressure × 100 → DB200.DBD8 REAL
+    - modbus_type: holding
+      modbus_start: 2
+      count: 1
+      s7_area: DB
+      s7_db: 200
+      s7_offset: 8
+      s7_format: real_x100     # 620 → 6.20 bar
+      tag_name: db200_pressure
+
+    # %QW3 → HR 3 → level × 10 → DB200.DBD12 REAL
+    - modbus_type: holding
+      modbus_start: 3
+      count: 1
+      s7_area: DB
+      s7_db: 200
+      s7_offset: 12
+      s7_format: real_x10      # 500 → 50.0 %
+      tag_name: db200_level
+
+    # %QW4 → HR 4 → setpoint × 10 → DB121.DBW0 WORD (HMI setpoint)
+    - modbus_type: holding
+      modbus_start: 4
+      count: 1
+      s7_area: DB
+      s7_db: 121
+      s7_offset: 0
+      s7_format: word
+
+    # %QW5 → HR 5 → step counter → MB0 (OB1 step state 0-4)
+    - modbus_type: holding
+      modbus_start: 5
+      count: 1
+      s7_area: M
+      s7_offset: 0
+      s7_format: byte
+      tag_name: marker_step
+
+    # %QW6 → HR 6 → scan cycle counter → MW2
+    - modbus_type: holding
+      modbus_start: 6
+      count: 1
+      s7_area: M
+      s7_offset: 2
+      s7_format: word
+      tag_name: marker_cycle_count
+
+    # Digital outputs (pump, valve, alarms) → QB0 and IB0 ─────────────
+    # %QX0.0 pump_run, %QX0.1 valve_open, %QX0.2 temp_hi, %QX0.3 temp_lo
+    - modbus_type: coil
+      modbus_start: 0
+      count: 8
+      s7_area: Q
+      s7_offset: 0
+      s7_format: bits_to_byte  # → QB0
+      tag_name: output_byte0
+
+    # Mirror alarms into I area for realistic I byte behaviour
+    - modbus_type: coil
+      modbus_start: 0
+      count: 8
+      s7_area: I
+      s7_offset: 0
+      s7_format: bits_to_byte  # → IB0
+      tag_name: input_byte0

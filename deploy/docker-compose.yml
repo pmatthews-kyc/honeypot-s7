@@ -1,0 +1,87 @@
+# docker-compose.yml — OpenPLC v3 process engine for S7 Honeypot
+# ================================================================
+#
+# PURPOSE
+# -------
+# Runs OpenPLC v3 in a Docker container alongside the S7 honeypot.
+# The OpenPLC container executes the self-driven process_sim.st
+# Structured Text program which produces realistic changing process
+# values (temperature, flow, pressure, level) with proper control
+# logic instead of random-walk simulation.
+#
+# KEY NETWORK ISOLATION DESIGN
+# ----------------------------
+# Modbus TCP (port 502) and the OpenPLC web IDE (port 8080) are
+# bound to 127.0.0.1 ONLY — not the external NIC.
+#
+#   External attacker scans host:   port 102 ✓, port 80 ✓, port 502 ✗
+#   modbus_bridge.py (localhost):   127.0.0.1:502 ✓  (reads process values)
+#
+# This eliminates the same-IP dual-protocol tell: port 502 simply
+# does not exist on the external network interface.
+#
+# USAGE
+# -----
+#   # First-time setup (run install_openplc.sh instead for full setup):
+#   docker compose up -d openplc
+#   # Check it's running:
+#   docker compose logs openplc
+#   # Upload program and start (done by install_openplc.sh):
+#   # (use OpenPLC web UI at http://127.0.0.1:8080, login openplc/openplc)
+#
+# REQUIREMENTS
+# ------------
+#   Docker Engine ≥ 20.10 and docker-compose-plugin (v2)
+#   OR docker-compose standalone ≥ 1.29
+#   OpenPLC image built by install_openplc.sh
+#
+# ================================================================
+
+services:
+
+  openplc:
+    # Image built from OpenPLC v3 source by install_openplc.sh
+    # Build command: docker build -t openplc:v3 <path>
+    image: openplc:v3
+
+    container_name: s7honeypot-openplc
+    restart: unless-stopped
+
+    # ── PORT BINDING ───────────────────────────────────────────────
+    # CRITICAL: both ports bound to 127.0.0.1 (loopback) only.
+    # Without the 127.0.0.1: prefix, Docker would bind to 0.0.0.0
+    # making the ports visible on ALL network interfaces including
+    # the external NIC — defeating the isolation entirely.
+    ports:
+      - "127.0.0.1:502:502"    # Modbus TCP — loopback only
+      - "127.0.0.1:8080:8080"  # OpenPLC web IDE — loopback only
+
+    # ── VOLUMES ────────────────────────────────────────────────────
+    volumes:
+      # Persist OpenPLC configuration and uploaded programs across
+      # container restarts (program upload survives docker restart)
+      - openplc_data:/workdir/webserver
+
+    # ── RESOURCE LIMITS ────────────────────────────────────────────
+    # Keep OpenPLC from starving the S7 honeypot processes on a Pi.
+    deploy:
+      resources:
+        limits:
+          cpus:   "0.5"    # max 50% of one CPU core
+          memory: "256M"
+
+    # ── HEALTH CHECK ───────────────────────────────────────────────
+    # Polls the OpenPLC web UI to confirm the runtime is up and
+    # accepting connections before modbus_bridge.py starts polling.
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8080"]
+      interval: 10s
+      timeout:  5s
+      retries:  6
+      start_period: 30s   # OpenPLC takes ~20s to compile and start
+
+# ── NAMED VOLUMES ──────────────────────────────────────────────────
+volumes:
+  openplc_data:
+    # Local driver — data lives in /var/lib/docker/volumes/ on the Pi
+    driver: local

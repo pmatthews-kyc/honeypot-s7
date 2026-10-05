@@ -1,2 +1,15 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Force LF line endings on everything that must run on the Pi. A Windows
+# checkout with CRLF would break shell scripts ("bad interpreter") and the
+# IEC 61131-3 program, and can confuse Python.
+*.sh    text eol=lf
+*.py    text eol=lf
+*.st    text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.service text eol=lf
+*.md    text eol=lf
+
+# Binary — never touch line endings
+*.png   binary
+*.pcap  binary
+*.db    binary

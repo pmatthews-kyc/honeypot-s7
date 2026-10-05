@@ -1,0 +1,46 @@
+name: tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the project's floor; test it and a couple above to catch
+        # version-specific breakage. These are the interpreter versions the
+        # test suite must pass on.
+        python-version: ["3.9", "3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Only the deps the TESTS need. python-snap7 and pymodbus are not
+          # required by the suite (it exercises the honeypot's own logic, not
+          # a live snap7 server), so we install just PyYAML + pytest.
+          pip install pyyaml pytest
+
+      - name: Run test suite
+        working-directory: tests
+        run: |
+          python -m pytest -v
+
+      - name: Syntax-check all sources and scripts
+        run: |
+          python -m py_compile src/*.py tools/*.py deploy/generate_services.py
+          bash -n deploy/install.sh
+          bash -n deploy/fingerprint_harden.sh
+          bash -n deploy/install_openplc.sh
