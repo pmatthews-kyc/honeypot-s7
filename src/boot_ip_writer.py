@@ -79,8 +79,38 @@ def _prefix_to_netmask(prefix_len: int) -> str:
     return ".".join(str((mask >> shift) & 0xFF) for shift in (24, 16, 8, 0))
 
 
-def write_state(iface: str, path: Path = STATE_PATH) -> dict:
-    info = get_interface_info(iface)
+# How long to wait for the interface to get an IPv4 address before giving
+# up. At boot this unit is ordered After=network-online.target, but on a
+# box without NetworkManager-wait-online / systemd-networkd-wait-online
+# that target is reached immediately -- before DHCP has answered. The MAC
+# spoof that runs just before us makes this worse (new MAC = fresh DHCP
+# exchange). Seen in the field: ip-writer failed at boot, a manual restart
+# 84 s later succeeded. So poll instead of failing on the first look.
+DEFAULT_WAIT_SECONDS = 90
+POLL_INTERVAL_SECONDS = 2
+
+
+def wait_for_interface_info(iface: str,
+                            timeout: float = DEFAULT_WAIT_SECONDS) -> dict:
+    """get_interface_info(), retried until the interface has an IPv4
+    address or `timeout` seconds have passed. Re-raises the last error."""
+    deadline = time.monotonic() + timeout
+    last_err: Exception | None = None
+    while True:
+        try:
+            return get_interface_info(iface)
+        except (RuntimeError, subprocess.CalledProcessError) as e:
+            last_err = e
+            if time.monotonic() >= deadline:
+                raise
+            print(f"Waiting for IPv4 address on {iface}... ({e})",
+                  file=sys.stderr)
+            time.sleep(POLL_INTERVAL_SECONDS)
+
+
+def write_state(iface: str, path: Path = STATE_PATH,
+                wait_seconds: float = DEFAULT_WAIT_SECONDS) -> dict:
+    info = wait_for_interface_info(iface, wait_seconds)
 
     # Fake uptime baseline: pick a random point in the last year and treat
     # it as this device's "boot time" for sysUpTime purposes, rather than
@@ -108,15 +138,28 @@ def write_state(iface: str, path: Path = STATE_PATH) -> dict:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <interface>", file=sys.stderr)
-        sys.exit(1)
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="Record the honeypot NIC's IP/netmask/MAC to network_state.json")
+    ap.add_argument("interface")
+    ap.add_argument("--settle", type=float, default=0.0, metavar="SEC",
+                    help="sleep this long first (post-MAC-spoof link flap); "
+                         "x-boot-settle-seconds in config.yaml")
+    ap.add_argument("--wait", type=float, default=DEFAULT_WAIT_SECONDS, metavar="SEC",
+                    help="then poll up to this long for an IPv4 address; "
+                         "x-boot-ip-wait-seconds in config.yaml")
+    args = ap.parse_args()
 
-    iface = sys.argv[1]
+    if args.settle > 0:
+        print(f"Settling {args.settle:g}s before reading {args.interface}...",
+              file=sys.stderr)
+        time.sleep(args.settle)
+
     try:
-        info = write_state(iface)
+        info = write_state(args.interface, wait_seconds=args.wait)
     except (subprocess.CalledProcessError, RuntimeError) as e:
-        print(f"ERROR: {e}", file=sys.stderr)
+        print(f"ERROR: {e} -- gave up after {args.wait:g}s; "
+              f"systemd will retry (Restart=on-failure)", file=sys.stderr)
         sys.exit(1)
 
     print(f"Wrote network state to {STATE_PATH}:")

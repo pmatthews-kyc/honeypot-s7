@@ -36,50 +36,88 @@ def check(label, ok, detail=""):
     return ok
 
 
-def read_modbus_holding_regs(host, port, start, count, unit=1, timeout=3.0):
-    """
-    Read holding registers via raw Modbus TCP (no pymodbus needed).
-    Returns list of INT16 values or None on failure.
-    """
-    tid = 1
-    # Build FC3 request: TID(2) PROTO(2) LEN(2) UNIT(1) FC(1) START(2) COUNT(2)
-    pkt = struct.pack(">HHHBBHH", tid, 0, 6, unit, 3, start, count)
+# Last failure reason from a Modbus read, so the checks below can say what
+# actually happened instead of a generic "No Modbus response". Two real
+# cases this used to hide: nothing listening inside the container
+# (docker-proxy resets the connection) and an exception reply.
+_last_err = ""
+
+_MODBUS_EXC = {
+    1: "illegal function", 2: "illegal data address", 3: "illegal data value",
+    4: "server device failure", 6: "server busy",
+    10: "gateway path unavailable", 11: "gateway target failed to respond",
+}
+
+
+def _recv_exact(s, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+
+def _modbus_read(host, port, fc, start, count, unit=1, timeout=3.0):
+    """Raw Modbus TCP read (FC1/FC3). Returns the data bytes, or None with
+    the reason left in _last_err."""
+    global _last_err
+    _last_err = ""
+    pkt = struct.pack(">HHHBBHH", fc, 0, 6, unit, fc, start, count)
     try:
         with socket.create_connection((host, port), timeout=timeout) as s:
             s.sendall(pkt)
-            header = s.recv(9)
-            if len(header) < 9:
+            header = _recv_exact(s, 8)          # MBAP(7) + function code
+            if len(header) < 8:
+                _last_err = ("connection closed with no reply — nothing is "
+                             "listening behind the port (PLC runtime stopped?)")
                 return None
-            byte_count = header[8]
-            data = s.recv(byte_count)
-            if len(data) < byte_count:
+            rfc = header[7]
+            if rfc & 0x80:
+                code = _recv_exact(s, 1)
+                c = code[0] if code else -1
+                _last_err = (f"Modbus exception {c} "
+                             f"({_MODBUS_EXC.get(c, 'unknown')}) for FC{fc}")
                 return None
-            regs = [struct.unpack_from(">H", data, i*2)[0] for i in range(count)]
-            # Convert to signed INT16
-            return [r if r < 32768 else r - 65536 for r in regs]
-    except Exception:
+            bc = _recv_exact(s, 1)
+            if not bc:
+                _last_err = "reply truncated before byte count"
+                return None
+            data = _recv_exact(s, bc[0])
+            if len(data) < bc[0]:
+                _last_err = f"reply truncated ({len(data)}/{bc[0]} bytes)"
+                return None
+            return data
+    except ConnectionResetError:
+        _last_err = ("connection reset — docker-proxy accepted but nothing "
+                     "listens on 502 inside the container (PLC runtime stopped)")
+    except socket.timeout:
+        _last_err = f"timed out after {timeout:g}s waiting for a reply"
+    except OSError as e:
+        _last_err = f"{type(e).__name__}: {e}"
+    return None
+
+
+def read_modbus_holding_regs(host, port, start, count, unit=1, timeout=3.0):
+    """FC3 holding registers -> list of signed INT16, or None (see _last_err)."""
+    data = _modbus_read(host, port, 3, start, count, unit, timeout)
+    if data is None:
         return None
+    regs = [struct.unpack_from(">H", data, i * 2)[0] for i in range(count)]
+    return [r if r < 32768 else r - 65536 for r in regs]
 
 
 def read_modbus_coils(host, port, start, count, unit=1, timeout=3.0):
-    """Read coils via raw Modbus TCP FC1."""
-    tid = 2
-    pkt = struct.pack(">HHHBBHH", tid, 0, 6, unit, 1, start, count)
-    try:
-        with socket.create_connection((host, port), timeout=timeout) as s:
-            s.sendall(pkt)
-            header = s.recv(9)
-            if len(header) < 9:
-                return None
-            byte_count = header[8]
-            data = s.recv(byte_count)
-            bits = []
-            for byte in data:
-                for b in range(8):
-                    bits.append((byte >> b) & 1)
-            return bits[:count]
-    except Exception:
+    """FC1 coils -> list of 0/1, or None (see _last_err)."""
+    data = _modbus_read(host, port, 1, start, count, unit, timeout)
+    if data is None:
         return None
+    bits = []
+    for byte in data:
+        for b in range(8):
+            bits.append((byte >> b) & 1)
+    return bits[:count]
 
 
 # ── main checks ────────────────────────────────────────────────────────────────
@@ -157,9 +195,16 @@ def main():
     coils = read_modbus_coils(mb_host, mb_port, 0, 4)
 
     if regs is None:
-        check("Read holding registers 0-6", False,
-              "No Modbus response — OpenPLC may still be starting")
+        check("Read holding registers 0-6", False, _last_err or "no reply")
         all_ok = False
+    elif not any(regs):
+        check("Read holding registers 0-6", False,
+              "registers read OK but ALL ZERO — the PLC runtime answers but "
+              "the program is not executing (or isn't process_sim). Upload "
+              "process_sim.st and Start PLC in the OpenPLC UI — "
+              "TROUBLESHOOTING §4")
+        all_ok = False
+        regs = None    # skip the range checks; they'd all just echo zero
     else:
         temp_x10, flow_x10, pres_x100, level_x10, setpt_x10, step, scan = regs
 
@@ -181,7 +226,7 @@ def main():
         all_ok &= (ok5 and ok6 and ok7 and ok8 and ok9)
 
     if coils is None:
-        check("Read coils 0-3", False, "No Modbus coil response")
+        check("Read coils 0-3", False, _last_err or "no reply")
         all_ok = False
     else:
         pump, valve, temp_hi, temp_lo = coils
@@ -217,7 +262,7 @@ def main():
                           f"(normal near setpoint)")
             all_ok &= ok_change
         else:
-            check("Second read succeeded", False, "Lost Modbus connection")
+            check("Second read succeeded", False, _last_err or "lost Modbus connection")
             all_ok = False
     print()
 

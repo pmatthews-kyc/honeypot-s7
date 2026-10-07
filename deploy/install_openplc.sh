@@ -9,6 +9,8 @@
 # 2. Builds the OpenPLC v3 Docker image from source
 # 3. Starts the OpenPLC container via docker-compose
 # 4. Waits for OpenPLC to be ready (polls web UI on port 8080)
+#    and installs openplc_autostart.sh as ExecStartPost so the PLC
+#    runtime is forced into RUN at every container start / reboot
 # 5. Uploads the self-driven process_sim.st program via the
 #    OpenPLC AJAX API
 # 6. Starts the uploaded program
@@ -47,6 +49,7 @@ OPENPLC_PASS="openplc"
 PROGRAM_FILE="${INSTALL_DIR}/openplc_program/process_sim.st"
 CONFIG_FILE="${INSTALL_DIR}/config.yaml"
 COOKIE_JAR="/tmp/openplc_cookies_$$.txt"
+PROGRAM_OK=0
 
 # Colour output
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
@@ -217,6 +220,30 @@ upload_program() {
     sleep 15
 }
 
+set_run_mode_setting() {
+    # Persist "Start OpenPLC in RUN mode" inside the container's settings
+    # DB so the runtime also auto-starts on its own, independent of
+    # openplc_autostart.sh. Best effort: the autostart hook is the real
+    # guarantee; this just makes the UI checkbox agree with it.
+    info "Enabling 'Start OpenPLC in RUN mode' in OpenPLC settings..."
+    docker exec s7honeypot-openplc python3 - <<'PYEOF' 2>/dev/null \
+        && info "Run-mode setting enabled" \
+        || warn "Could not set run-mode flag (openplc_autostart.sh still forces RUN at every start)"
+import sqlite3, glob, sys
+paths = glob.glob("/workdir/webserver/*.db") + glob.glob("/**/webserver/openplc.db", recursive=True)
+for p in paths:
+    try:
+        c = sqlite3.connect(p)
+        n = c.execute("UPDATE Settings SET Value='true' WHERE Key='Start_run_mode'").rowcount
+        c.commit(); c.close()
+        if n:
+            sys.exit(0)
+    except Exception:
+        pass
+sys.exit(1)
+PYEOF
+}
+
 start_program() {
     info "Starting PLC program..."
     curl -sf --max-time 10 \
@@ -227,17 +254,17 @@ start_program() {
 }
 
 verify_modbus() {
-    info "Verifying Modbus TCP is listening on 127.0.0.1:502..."
-    if command -v nc &>/dev/null; then
-        if nc -z -w 3 127.0.0.1 502 2>/dev/null; then
-            info "Modbus TCP is responding on 127.0.0.1:502"
-        else
-            warn "Modbus TCP not yet responding — it may start after the"
-            warn "first scan cycle. Try: nc -z 127.0.0.1 502 (in ~10s)"
-        fi
+    # Same check the boot unit runs: 502 listening inside the container AND
+    # the scan counter advancing. An open port alone is not enough — the
+    # runtime can answer with every register at zero when no program runs.
+    info "Verifying the PLC program is executing (Modbus 502 + scan counter)..."
+    if bash "${DEPLOY_DIR}/openplc_autostart.sh"; then
+        PROGRAM_OK=1
+        info "process_sim is executing — Modbus values are live"
     else
-        info "nc not available — skipping Modbus connectivity check"
-        info "Verify manually: nc -z 127.0.0.1 502"
+        PROGRAM_OK=0
+        warn "The PLC program is NOT executing yet."
+        warn "Follow 'FINISH IN THE OPENPLC UI' in the summary below."
     fi
 
     # Verify Docker daemon is NOT listening on TCP (would be a remote root)
@@ -328,8 +355,12 @@ Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=${DEPLOY_DIR}
 ExecStart=/usr/bin/docker compose -f ${COMPOSE_FILE} up -d openplc
+# The container coming up does NOT start the PLC runtime (and so Modbus
+# 502) unless OpenPLC's "start in RUN mode" setting is saved. Force it
+# every start; fails the unit if 502 never opens inside the container.
+ExecStartPost=/bin/bash ${DEPLOY_DIR}/openplc_autostart.sh
 ExecStop=/usr/bin/docker compose -f ${COMPOSE_FILE} stop openplc
-TimeoutStartSec=120
+TimeoutStartSec=300
 
 [Install]
 WantedBy=multi-user.target
@@ -348,24 +379,56 @@ print_summary() {
     echo -e "${GREEN}  OpenPLC installation complete                        ${NC}"
     echo -e "${GREEN}═══════════════════════════════════════════════════════${NC}"
     echo ""
-    echo "  OpenPLC container: docker compose logs openplc"
-    echo "  Web IDE (localhost only): http://127.0.0.1:8080"
-    echo "    Login: openplc / openplc"
-    echo "  Modbus TCP: 127.0.0.1:502 (loopback only, NOT on external NIC)"
+    if [[ "${PROGRAM_OK}" -eq 1 ]]; then
+        echo -e "  Program status: ${GREEN}process_sim EXECUTING${NC} (scan counter advancing)"
+    else
+        echo -e "  Program status: ${RED}NOT EXECUTING${NC} — do steps 1–3 below now"
+    fi
     echo ""
-    echo "  Process simulation:"
-    echo "    Temperature: oscillates ±3°C around 75°C setpoint"
-    echo "    Flow:        ramps 0→120 l/min, drops on stop"
-    echo "    Pressure:    3.1→6.2 bar following pump state"
-    echo "    Level:       drains 50%→10% then refills, repeating"
+    echo "  ── FINISH IN THE OPENPLC UI (do this once, even if status is OK) ──"
     echo ""
-    echo "  S7comm reads (DB200) now return real IEC 61131-3 values"
-    echo "  Port 502 is absent from external network scan"
+    echo "  The OpenPLC web UI listens on the Pi's loopback only. From your"
+    echo "  workstation, open a tunnel and browse to it:"
     echo ""
-    echo "  To disable OpenPLC and revert to process_simulator:"
+    echo "      ssh -L 8080:localhost:8080 ${SUDO_USER:-<user>}@<honeypot-ip>"
+    echo "      http://localhost:8080          login: openplc / openplc"
+    echo ""
+    echo "  1. Upload the process program (skip if the Dashboard already shows"
+    echo "     'process_sim' and Status: Running):"
+    echo "       Programs -> Upload Program -> choose process_sim.st"
+    echo "       (copy it from ${PROGRAM_FILE}"
+    echo "        or from openplc_program/ in the release zip)"
+    echo "       -> Upload Program -> Launch program -> wait for"
+    echo "       'Compilation finished successfully'."
+    echo ""
+    echo "  2. Start it:  Dashboard -> Start PLC"
+    echo ""
+    echo "  3. Make it start on every boot:"
+    echo "       Settings -> tick 'Start OpenPLC in RUN mode' -> Save changes"
+    echo "     (s7honeypot-openplc.service also forces RUN at each start via"
+    echo "      openplc_autostart.sh, and FAILS the unit if the program isn't"
+    echo "      executing — so a bad program shows up in systemctl, not as a"
+    echo "      frozen portal.)"
+    echo ""
+    echo "  Confirm from the Pi:"
+    echo "      sudo ${INSTALL_DIR}/venv/bin/python3 ${INSTALL_DIR}/tools/check_openplc.py ${CONFIG_FILE}"
+    echo "      sudo cat /var/lib/s7honeypot/process_state.json   # marker_cycle_count climbing"
+    echo ""
+    echo "  ── WHAT process_sim DOES ──"
+    echo "    Temperature: heater holds ~30 °C (±0.5 °C hysteresis)"
+    echo "    Flow:        0 -> 120 l/min while the pump runs, 0 when stopped"
+    echo "    Pressure:    3.1 -> 6.2 bar following pump state"
+    echo "    Level:       drains while pumping, refills when idle"
+    echo "    Sequencer:   IDLE -> STARTING -> RUNNING -> STOPPING (HR5)"
+    echo "    Scan count:  HR6, increments every scan"
+    echo ""
+    echo "  Modbus TCP: 127.0.0.1:502 (loopback only — absent from external scans)"
+    echo "  Container logs: docker logs s7honeypot-openplc --tail 40"
+    echo ""
+    echo "  To disable OpenPLC and revert to the built-in simulator:"
     echo "    1. Set x-openplc: false and x-modbus-bridge: false in config.yaml"
-    echo "    2. Run: docker compose stop openplc"
-    echo "    3. Restart honeypot services"
+    echo "    2. sudo systemctl disable --now s7honeypot-openplc"
+    echo "    3. sudo systemctl restart s7honeypot-backend"
     echo ""
 }
 
@@ -391,6 +454,7 @@ main() {
     openplc_login
     upload_program
     start_program
+    set_run_mode_setting
     verify_modbus
     cleanup_cookies
     update_config

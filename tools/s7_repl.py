@@ -312,7 +312,24 @@ def cmd_diag_buffer(client: Client):
 
 
 def cmd_cpu_state(client: Client):
-    print(f"  CPU state: {client.get_cpu_state()}")
+    """
+    Decode SZL 0x0424 ourselves. python-snap7 3.2.x's get_cpu_state() is a
+    stub that always returns 'S7CpuStatusRun' without looking at the
+    response, so it reports RUN even on a stopped PLC. The record layout
+    (confirmed from a real S7-300 capture): bytes [2:4] = mode word,
+    0xFF08 = STOP, 0xFF28 = RUN (low byte is the operating mode).
+    """
+    try:
+        szl = client.read_szl(0x0424, 0)
+        data = bytes(szl.Data[:40])
+        # Data begins with the 4-byte lpr/nrec header (the client doesn't strip it)
+        rec = data[4:]
+        mode = rec[3] if len(rec) > 3 else None
+        label = {0x08: "STOP", 0x28: "RUN"}.get(mode, f"unknown (0x{mode:02x})" if mode is not None else "unknown")
+        print(f"  CPU state: {label}   (SZL 0x0424 mode word 0x{rec[2]:02x}{rec[3]:02x})")
+    except Exception as e:
+        # Fall back to the library call, with a note that it may be unreliable
+        print(f"  CPU state: {client.get_cpu_state()}   (library decode; SZL 0x0424 read failed: {e})")
 
 
 def cmd_cpu_info(client: Client):

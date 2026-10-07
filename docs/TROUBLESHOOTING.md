@@ -187,10 +187,39 @@ docker compose version
 
 ## 4. OpenPLC is "up but not running"
 
-The most common OpenPLC problem: the container is healthy and port 502 is open,
-but every register reads `0` and the scan counter never advances (see the loop
-in section 1). The program is loaded but sitting in **STOP** — OB1 isn't
-executing, so nothing writes the registers.
+Two variants of the same root cause — the container is running but the PLC
+**runtime** inside it is not:
+
+**A. After a reboot: portal shows "Process data acquisition fault", the backend
+journal loops `OpenPLC Modbus connected` / `Connecting to OpenPLC Modbus…`
+every 500 ms, and `poll failed … Connection reset by peer`.** `check_openplc.py`
+passes the TCP connect but gets no Modbus response. The container restarted,
+its web UI is up (the only thing in `docker logs` is the health-check's
+`GET / → 302`), but OpenPLC v3 only starts the runtime — and with it the Modbus
+server on 502 — if "Start OpenPLC in RUN mode" was saved in its settings.
+`docker-proxy` on the host still accepts on `127.0.0.1:502`, then resets the
+connection because nothing listens inside. Confirm with:
+
+```bash
+sudo docker exec s7honeypot-openplc sh -c 'ss -tln | grep :502 || echo "502 closed inside container"'
+```
+
+Since this was found, `s7honeypot-openplc.service` runs
+`deploy/openplc_autostart.sh` after the container starts: it waits for the web
+UI, logs in, sends `start_plc`, and fails the unit unless 502 is listening
+inside the container **and** the program's scan counter (HR6) is advancing. So on a current install this variant shows up as the
+**openplc unit failed** (`systemctl status s7honeypot-openplc`), which points at
+the program itself (variant B / re-upload below). On an install that predates
+the hook, start the program by hand once and enable run mode as described next.
+
+**B. Runtime up, program not executing:** port 502 answers, every register
+reads `0` and the scan counter never advances. `process_state.json` keeps
+getting a fresh timestamp but every tag is `0.0`, and the backend journal is
+silent — the bridge's reads *succeed*, they just return zeros. Seen after a
+reboot when the runtime came up without a running program. On a current
+install `s7honeypot-openplc` fails with `scan counter (HR6) stuck at 0`, and
+`check_openplc.py` reports `registers read OK but ALL ZERO`. Fix: upload
+`process_sim.st` and start it (below).
 
 ### Start the program
 
@@ -377,8 +406,13 @@ firewall is hiding something). Check and re-apply on the honeypot:
 
 ```bash
 sudo bash /opt/s7honeypot/deploy/fingerprint_harden.sh status
+# if the 1102 rule is missing or a DROP version is present:
+sudo bash /opt/s7honeypot/deploy/fingerprint_harden.sh revert
 sudo bash /opt/s7honeypot/deploy/fingerprint_harden.sh apply
 ```
+
+`apply` appends rules. Running it while rules are already present leaves
+duplicates, so `revert` first whenever any rule is present.
 
 ---
 
@@ -398,9 +432,11 @@ journal:
 sudo journalctl -u s7honeypot-harden --since "10 min ago" --no-pager
 ```
 
-Re-apply manually if needed with `fingerprint_harden.sh apply`. Do **not**
-routinely restart `s7honeypot-harden` to fix things (section 2, Tier 3) — run
-the script's `apply` directly instead.
+Re-apply manually with the script, not by restarting the unit (section 2,
+Tier 3). If no rules are present, run `apply`. If some rules are present but
+others are missing (typically the `DOCKER-USER` ones, when hardening ran
+before Docker finished starting), run `revert` then `apply` so nothing ends up
+duplicated.
 
 ---
 
@@ -417,6 +453,6 @@ the script's `apply` directly instead.
 | Diagnostic buffer empty | database-path check (§6) |
 | Process overview blank | `process_state.json` age (§6) |
 | "acquisition fault" on portal | watchdog; fix OpenPLC (§7) |
-| Port 1102 shows `filtered` | `fingerprint_harden.sh apply` (§8) |
+| Port 1102 shows `filtered` | `fingerprint_harden.sh revert` then `apply` (§8) |
 | Docker/compose build fails | `curl -fsSL https://get.docker.com \| sh` (§3) |
 | IP changed, SNMP/web wrong | `systemctl restart s7honeypot-ip-writer` (§2) |

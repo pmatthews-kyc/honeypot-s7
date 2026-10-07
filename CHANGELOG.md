@@ -6,6 +6,86 @@ All notable changes to honeypot-s7 are recorded here. Format loosely follows
 
 ## [Unreleased]
 
+- **OpenPLC boot check now requires the program to be executing.** After a
+  reboot the runtime answered on 502 with every register at zero (no program
+  running); the bridge copied zeros, the portal froze, and nothing reported
+  an error. `openplc_autostart.sh` now also reads the scan counter (HR6)
+  across a 2 s window and fails `s7honeypot-openplc` if it isn't advancing.
+  `install_openplc.sh` runs the same check at the end, prints a Program
+  status line, and finishes with explicit OpenPLC UI steps (upload
+  `process_sim.st`, Start PLC, enable "Start in RUN mode"); its stale process
+  description (75 °C setpoint etc.) now matches `process_sim.st`.
+  `check_openplc.py` reports the real failure (connection reset / Modbus
+  exception code / truncated reply) and flags all-zero registers, instead of
+  a generic "No Modbus response".
+
+- **OpenPLC runtime forced into RUN at every container start.** After a
+  reboot the OpenPLC container came back but the PLC runtime (and Modbus 502
+  inside it) did not — OpenPLC v3 only auto-starts it if "Start in RUN mode"
+  was saved. The host-side `docker-proxy` still accepted on 127.0.0.1:502 and
+  reset every read, so the bridge looped connect/reconnect and the portal
+  showed "Process data acquisition fault". New `deploy/openplc_autostart.sh`
+  runs as `ExecStartPost` of `s7honeypot-openplc.service`: waits for the web
+  UI, logs in, sends `start_plc`, and fails the unit if 502 never opens inside
+  the container. `install_openplc.sh` also sets the run-mode flag in
+  OpenPLC's settings DB so the two agree. TROUBLESHOOTING §4 documents the
+  symptom.
+
+- **Boot order: everything starts after ip-writer.** `harden`, `backend`
+  (and therefore `proxy`) and `synack-spoof` now carry `After=`/`Wants=`
+  `s7honeypot-ip-writer`, so the full chain is mac-spoof → ip-writer → the
+  rest. ip-writer takes `--settle` (default 5 s, for the post-MAC-spoof link
+  flap) and `--wait` (default 90 s, DHCP poll) from two new config keys,
+  `x-boot-settle-seconds` / `x-boot-ip-wait-seconds`; the unit's
+  `TimeoutStartSec` is derived from them.
+
+- **ip-writer no longer fails at boot on slow DHCP.** On a Debian box with
+  no `*-wait-online` unit, `network-online.target` is reached before the NIC
+  has an address, so `boot_ip_writer.py` ran too early, exited 1, and took
+  `snmp` + `web` down with it (`Requires=`). Seen on a fresh install: failed
+  at boot, succeeded on a manual restart 84 s later. Now: the script polls for
+  up to 90 s for an IPv4 address; the unit has `Restart=on-failure` as a
+  backstop; and `snmp`/`web` use `Wants=` so a late lease delays the recorded
+  IP instead of stopping those services.
+
+- **TTL rewrite now covers UDP.** SNMP replies were leaving with the Linux
+  TTL (nmap `-sU` showed `ttl 64` on 161) while TCP and ICMP showed 30.
+  `fingerprint_harden.sh` apply/revert/status handle `udp` alongside
+  `tcp`/`icmp`.
+
+- **Installer exercised end to end on a clean Debian-family host** (Ubuntu
+  24.04 container, root, no systemd). Fixes from that run:
+  - `python3-netfilterqueue` is not packaged on every release (absent on
+    Ubuntu 24.04, present on Debian 12 / Raspberry Pi OS). `install.sh` now
+    tries apt first and otherwise builds `NetfilterQueue` from pip inside the
+    venv (installing `libnetfilter-queue-dev` + `python3-dev`), instead of
+    aborting the whole install.
+  - `honeypot.py` (the proxy) never called `cpu_state.configure()` /
+    `diag_log.configure()`, so STOP/RUN transitions were written to the
+    state dir of whatever `config.yaml` was in the current directory rather
+    than the config it was started with. This also made the test suite leak
+    a STOP into the real `/var/lib/s7honeypot/`.
+  - `verify_live_db_reads.py` tries the python-snap7 3.2 keyword
+    (`tcp_port=`) before the 3.1 one (`tcpport=`).
+  - `s7_repl.py` option 6 decodes SZL 0x0424 itself: python-snap7 3.2.x's
+    `get_cpu_state()` is a stub that always answers RUN.
+  - `generate_services.py` and `fingerprint_harden.sh` no longer print
+    stale "next steps" / "not persistent" advice that contradicts the
+    installer and the boot unit.
+
+- **INSTALL.md fast path rewritten.** The old fast path said to edit config
+  after installing, which meant the units and hardening rules were generated
+  for the example interface (`ens33`). It also said to start only
+  `s7honeypot-proxy`, which pulled in the backend but left the MAC spoof, IP
+  writer, hardening, SNMP, web portal and SYN-ACK spoofer stopped. It now
+  configures first, places OpenPLC before the first start, and starts the
+  units with a reboot or an explicit ordered start. It adds a verification
+  checklist (expected unit states, listening ports, every iptables/ip6tables
+  rule, network-state match, external nmap/ping/PDU checks), a
+  symptom→fix table, and a safe procedure for changing config after install.
+  README, the TROUBLESHOOTING hardening sections and `install.sh`'s printed
+  next steps now match it.
+
 - **`s7_repl.py` option 19 — scan a DB number range.** Probes each DB in a
   range (default 1–50) and classifies it as DATA (first 8 bytes shown in hex +
   ASCII), all-zeros, or ERROR (absent). Warns up front that large ranges are

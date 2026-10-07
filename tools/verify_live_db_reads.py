@@ -228,11 +228,11 @@ def main():
         import snap7
         client = snap7.client.Client()
         try:
-            client.connect(args.host, args.rack, args.slot, tcpport=args.port)
+            # python-snap7 3.2+ renamed the keyword tcpport= -> tcp_port=;
+            # 3.1.x (validated on target hardware) only accepts tcpport=.
+            client.connect(args.host, args.rack, args.slot, tcp_port=args.port)
         except TypeError:
-            # Older/newer python-snap7 builds may not accept tcpport= --
-            # fall back to the 3-arg form (implies port 102).
-            client.connect(args.host, args.rack, args.slot)
+            client.connect(args.host, args.rack, args.slot, tcpport=args.port)
         ok = check("Connected", bool(client.get_connected())
                    if hasattr(client, "get_connected") else True)
         if not ok:

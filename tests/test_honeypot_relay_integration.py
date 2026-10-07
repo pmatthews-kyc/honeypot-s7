@@ -33,6 +33,12 @@ def _make_proxy(szl_status_intercept_enabled: bool = False):
     cfg["storage"]["data_dir"] = tmpdir
     cfg["storage"]["require_mount"] = False
     cfg["capture"]["enabled"] = False
+    # Keep runtime state (cpu_state.json, honeypot.db) in the temp dir —
+    # otherwise the PLC STOP exercised below is written to the REAL
+    # /var/lib/s7honeypot and a later fresh install boots into STOP.
+    cfg["x-state-dir"] = tmpdir
+    cfg.setdefault("logging", {})["state_dir"] = tmpdir
+    cfg["logging"]["honeypot_db"] = os.path.join(tmpdir, "honeypot.db")
     cfg["ladder_program"]["szl_status_intercept_enabled"] = szl_status_intercept_enabled
 
     tmp_config = os.path.join(tmpdir, "test_config.yaml")

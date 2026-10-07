@@ -81,7 +81,7 @@ is, at the kernel level, obviously Linux. This closes the cheap, high-value
 gaps:
 
 - **TTL rewrite** via `iptables -t mangle` on outbound traffic from the
-  honeypot interface (both TCP and ICMP), setting the IP TTL to **30** — the
+  honeypot interface (both TCP, ICMP and UDP), setting the IP TTL to **30** — the
   confirmed value a real Siemens S7-300 presents. This is distinctive: not
   Linux's 64, Windows' 128, or network-gear 255. Applying it to ICMP as well
   as TCP matters because a `ping` echo reply doesn't originate from the S7

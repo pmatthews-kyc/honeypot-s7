@@ -72,7 +72,15 @@ Before=s7honeypot-snmp.service
 
 [Service]
 Type=oneshot
-ExecStart={PYTHON} {SRC_DIR}/boot_ip_writer.py {IFACE}
+# Settle {BOOT_SETTLE}s for the post-MAC-spoof link flap, then poll up to
+# {BOOT_IP_WAIT}s for an IPv4 address (x-boot-settle-seconds /
+# x-boot-ip-wait-seconds in config.yaml). If it still gives up, retry rather
+# than staying failed for the rest of the boot -- network-online.target is
+# unreliable on boxes without a wait-online unit.
+ExecStart={PYTHON} {SRC_DIR}/boot_ip_writer.py {IFACE} --settle {BOOT_SETTLE} --wait {BOOT_IP_WAIT}
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec={IP_WRITER_TIMEOUT}
 RemainAfterExit=yes
 
 [Install]
@@ -82,8 +90,8 @@ WantedBy=multi-user.target
 "s7honeypot-backend.service": """\
 [Unit]
 Description=S7 Honeypot - snap7 backend (loopback only, port {BACKEND_PORT})
-After=network-online.target
-Wants=network-online.target
+After=s7honeypot-ip-writer.service network-online.target
+Wants=s7honeypot-ip-writer.service network-online.target
 
 [Service]
 Type=simple
@@ -119,7 +127,10 @@ WantedBy=multi-user.target
 [Unit]
 Description=S7 Honeypot - SNMP agent (port {SNMP_PORT})
 After=s7honeypot-ip-writer.service network-online.target
-Requires=s7honeypot-ip-writer.service
+# Wants, not Requires: these services start fine without
+# network_state.json (they re-read it on every request), so a slow DHCP
+# lease should delay the recorded IP, not take the whole surface down.
+Wants=s7honeypot-ip-writer.service
 Wants=network-online.target
 {REQUIRES_MOUNT}
 [Service]
@@ -138,7 +149,10 @@ WantedBy=multi-user.target
 [Unit]
 Description=S7 Honeypot - Siemens web diagnostic portal (port {WEB_PORT})
 After=s7honeypot-ip-writer.service network-online.target
-Requires=s7honeypot-ip-writer.service
+# Wants, not Requires: these services start fine without
+# network_state.json (they re-read it on every request), so a slow DHCP
+# lease should delay the recorded IP, not take the whole surface down.
+Wants=s7honeypot-ip-writer.service
 Wants=network-online.target
 {REQUIRES_MOUNT}
 [Service]
@@ -156,11 +170,9 @@ WantedBy=multi-user.target
 "s7honeypot-synack-spoof.service": """\
 [Unit]
 Description=S7 Honeypot - SYN-ACK fingerprint spoofer (NFQUEUE {SYNACK_QUEUE})
-# fingerprint_harden.sh must have added the NFQUEUE iptables rule before
-# this unit starts.  Either run it in a Before= oneshot unit or ensure
-# iptables-persistent restores the rule at boot.
-After=network-online.target
-Wants=network-online.target
+# s7honeypot-harden (Before= this unit) adds the NFQUEUE rule first.
+After=s7honeypot-ip-writer.service network-online.target
+Wants=s7honeypot-ip-writer.service network-online.target
 
 [Service]
 Type=simple
@@ -182,8 +194,8 @@ Description=S7 Honeypot - apply network/TCP fingerprint hardening at boot
 # the honeypot running but UNHARDENED and silently more detectable until
 # someone re-runs fingerprint_harden.sh by hand. Ordered before the proxy
 # and the SYN-ACK spoofer so their required iptables rules exist first.
-After=network-online.target
-Wants=network-online.target
+After=s7honeypot-ip-writer.service network-online.target
+Wants=s7honeypot-ip-writer.service network-online.target
 Before=s7honeypot-proxy.service s7honeypot-synack-spoof.service
 
 [Service]
@@ -282,6 +294,8 @@ def main() -> None:
     require_mount= cfg.get("x-require-mount",cfg.get("require_mount",  True))
     oui          = cfg.get("x-siemens-oui", cfg.get("siemens_oui",    "28:63:36"))
     target_ttl   = cfg.get("x-target-ttl",  cfg.get("target_ttl",       30))
+    boot_settle  = int(cfg.get("x-boot-settle-seconds",  cfg.get("boot_settle_seconds",   5)))
+    boot_ip_wait = int(cfg.get("x-boot-ip-wait-seconds", cfg.get("boot_ip_wait_seconds", 90)))
     s7_port      = cfg.get("x-port-s7",     cfg.get("s7_port",         102))
     snmp_port    = cfg.get("x-port-snmp",   cfg.get("snmp_port",       161))
     web_port     = cfg.get("x-port-web",    cfg.get("web_port",         80))
@@ -317,6 +331,10 @@ def main() -> None:
         "BACKEND_PORT":  backend_port,
         "SYNACK_QUEUE":  synack_queue,
         "TARGET_TTL":    target_ttl,
+        "BOOT_SETTLE":   boot_settle,
+        "BOOT_IP_WAIT":  boot_ip_wait,
+        # settle + wait + margin, so systemd doesn't kill a still-polling run
+        "IP_WRITER_TIMEOUT": boot_settle + boot_ip_wait + 30,
     }
 
     # Determine output directory
@@ -344,14 +362,10 @@ def main() -> None:
     _patch_harden_script(harden, subs)
 
     print()
-    print("Next steps:")
+    print("To activate the regenerated units:")
     print(f"  sudo cp {out_dir}/*.service /etc/systemd/system/")
     print( "  sudo systemctl daemon-reload")
-    print(f"  sudo {args.install_dir}/fingerprint_harden.sh apply")
-    print()
-    print("To reinstall after config changes:")
-    print(f"  python3 {Path(__file__).name} --install-dir {args.install_dir}")
-    print( "  sudo cp systemd/*.service /etc/systemd/system/ && sudo systemctl daemon-reload")
+    print( "  (install.sh does this for you; see INSTALL.md → The fast path)")
 
 
 if __name__ == "__main__":

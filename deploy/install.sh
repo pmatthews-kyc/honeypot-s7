@@ -9,12 +9,13 @@
 # Usage:
 #   sudo bash deploy/install.sh [--install-dir /opt/s7honeypot] [--interface eth0]
 #
-# After installation:
-#   1. nano /opt/s7honeypot/config.yaml        (set interface, identity)
-#   2. sudo bash /opt/s7honeypot/deploy/fingerprint_harden.sh apply
-#   3. sudo systemctl start s7honeypot-proxy
-#   Optional (OpenPLC process engine — installs Docker separately):
-#   4. sudo bash /opt/s7honeypot/deploy/install_openplc.sh
+# Before installation: cp config.yaml.example config.yaml and set
+#   x-interface + a unique serial — the units and fingerprint_harden.sh
+#   are generated from it.
+# After installation (see INSTALL.md → The fast path):
+#   1. Optional: sudo bash /opt/s7honeypot/deploy/install_openplc.sh
+#   2. sudo reboot   (or start units in order — INSTALL.md Step 4)
+#   3. Verify — INSTALL.md Step 5
 # ================================================================
 
 set -euo pipefail
@@ -68,11 +69,27 @@ export DEBIAN_FRONTEND=noninteractive
 echo "wireshark-common wireshark-common/install-setuid boolean false" \
     | debconf-set-selections 2>/dev/null || true
 
-apt-get update -qq
+# `apt-get update` warns (non-fatal) if an unrelated third-party repo on
+# the box is unreachable; only a failure to fetch the main indexes matters,
+# and that surfaces as "Unable to locate package" on the install below.
+apt-get update -qq || warn "apt-get update reported errors — continuing"
 apt-get install -y \
-    python3 python3-pip python3-venv python-is-python3 \
-    python3-yaml python3-netfilterqueue build-essential \
+    python3 python3-pip python3-venv python3-dev python-is-python3 \
+    python3-yaml build-essential \
     tshark macchanger iptables iproute2 net-tools procps curl git
+
+# python3-netfilterqueue (the SYN-ACK spoofer's NFQUEUE binding) is packaged
+# on Debian/Raspberry Pi OS but NOT on every Debian-family release (Ubuntu
+# 24.04 lacks it). Try apt first; if absent, build the same module from pip
+# inside the venv later (needs libnetfilter-queue-dev + python3-dev).
+NFQ_FROM_PIP=0
+if apt-get install -y python3-netfilterqueue 2>/dev/null; then
+    info "python3-netfilterqueue installed from apt"
+else
+    warn "python3-netfilterqueue not in apt on this release — will build via pip"
+    apt-get install -y libnetfilter-queue-dev
+    NFQ_FROM_PIP=1
+fi
 
 if command -v python &>/dev/null; then
     info "python -> $(python --version 2>&1)"
@@ -123,6 +140,17 @@ info "Installing Python packages into the virtualenv..."
 "${VENV}/bin/pip" install "pymodbus>=3.0.0" || \
     warn "pymodbus not installed — only needed for the OpenPLC bridge"
 
+if [[ "${NFQ_FROM_PIP}" -eq 1 ]]; then
+    info "Building NetfilterQueue in the virtualenv (pip)..."
+    "${VENV}/bin/pip" install "NetfilterQueue>=1.1.0" || \
+        warn "NetfilterQueue pip build failed — SYN-ACK spoofer will not run (see syn_ack_spoofer.py)"
+fi
+if "${VENV}/bin/python" -c 'import netfilterqueue' 2>/dev/null; then
+    info "netfilterqueue imports cleanly in the venv"
+else
+    warn "netfilterqueue did not import in the venv — s7honeypot-synack-spoof will fail to start"
+fi
+
 if "${VENV}/bin/python" -c 'import snap7' 2>/dev/null; then
     info "python-snap7 imports cleanly in the venv"
 else
@@ -158,18 +186,13 @@ echo ""
 echo "  Python:  ${PY_FULL}  (venv: ${VENV})"
 echo "  Services run under: ${VENV}/bin/python3"
 echo ""
-echo "  Next steps:"
-echo "  1. nano ${INSTALL_DIR}/config.yaml   (interface + UNIQUE serial/identity)"
-echo "  2. sudo bash ${INSTALL_DIR}/deploy/fingerprint_harden.sh apply"
-echo "     (also runs automatically at every boot via s7honeypot-harden.service)"
-echo "  3. sudo systemctl start s7honeypot-proxy"
-echo ""
-echo "  If you change interface/paths in config, re-generate the units:"
-echo "     sudo ${VENV}/bin/python ${INSTALL_DIR}/deploy/generate_services.py \\"
-echo "         --install-dir ${INSTALL_DIR}"
-echo "     sudo cp ${INSTALL_DIR}/deploy/systemd/*.service /etc/systemd/system/"
-echo "     sudo systemctl daemon-reload"
-echo ""
-echo "  Optional OpenPLC engine (installs Docker itself when run):"
+echo "  Next steps (full detail: INSTALL.md → The fast path):"
+echo "  1. Confirm ${INSTALL_DIR}/config.yaml has the right x-interface and a"
+echo "     UNIQUE serial. If you change interface/ports/paths now, see"
+echo "     'Changed config after installing' in INSTALL.md before starting."
+echo "  2. Optional OpenPLC — do this BEFORE the first start:"
 echo "     sudo bash ${INSTALL_DIR}/deploy/install_openplc.sh"
+echo "  3. Start everything:  sudo reboot"
+echo "     (or start each unit in order — INSTALL.md, Step 4 Option B)"
+echo "  4. Verify services, ports and firewall rules — INSTALL.md, Step 5"
 echo ""

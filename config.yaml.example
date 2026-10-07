@@ -36,6 +36,14 @@ x-siemens-oui: &siemens_oui "28:63:36"
 # Only change this if you are emulating a different device with a known TTL.
 x-target-ttl: &target_ttl 30
 
+# Boot timing for the ip-writer step (records IP/MAC for SNMP + the portal).
+# After the MAC spoof the link flaps and DHCP hands out a fresh lease, which
+# can take a while. ip-writer first waits `settle` seconds for the flap to
+# finish, then polls for up to `wait` seconds for an IPv4 address, returning
+# as soon as one appears. Every other honeypot service starts after it.
+x-boot-settle-seconds: &boot_settle 5
+x-boot-ip-wait-seconds: &boot_ip_wait 90
+
 # Persistent diagnostic event log (STOP/START commands, mode transitions).
 # Survives reboots so the web portal diagnostic buffer shows the full
 # operator history. Change to a path on your removable drive if you want

@@ -96,21 +96,26 @@ On a Debian-based Raspberry Pi (or similar SBC):
 ```bash
 git clone <your-repo-url> honeypot-s7
 cd honeypot-s7
-cp config.yaml.example config.yaml     # then edit — see below
+cp config.yaml.example config.yaml
+nano config.yaml                       # x-interface + unique serial FIRST
 sudo bash deploy/install.sh
 ```
 
-`install.sh` installs system and Python dependencies, deploys to
-`/opt/s7honeypot`, generates and enables the systemd units, and prints the
-next steps. Then:
+Edit `config.yaml` **before** running `install.sh` — at minimum
+`x-interface` and a unique serial. The installer generates the systemd units
+and the hardening rules from it. `install.sh` installs system and Python
+dependencies, deploys to `/opt/s7honeypot`, and enables the units. Then:
 
 ```bash
-nano /opt/s7honeypot/config.yaml               # set interface, identity
-sudo bash /opt/s7honeypot/deploy/fingerprint_harden.sh apply
-sudo systemctl start s7honeypot-proxy
+sudo reboot        # starts every unit in the right order
 ```
 
-**Optional — realistic process values from OpenPLC:**
+[INSTALL.md → The fast path](INSTALL.md#the-fast-path) has the full sequence,
+how to start without rebooting, and a checklist to confirm services, ports and
+firewall rules are correct.
+
+**Optional — realistic process values from OpenPLC** (run this after
+`install.sh` and *before* the reboot):
 
 OpenPLC runs in Docker. You do **not** need Docker installed beforehand —
 `install_openplc.sh` installs Docker Engine and the compose plugin for you,

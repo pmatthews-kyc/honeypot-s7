@@ -52,6 +52,8 @@ from s7_precheck import peek_validate_cotp_cr
 import s7_header as sh
 from read_write_parser import parse_from_frame, FUNCTION_CODE as FUNCTION_CODE_NAMES
 from storage import resolve_and_verify, substitute_data_dir, StorageError
+import cpu_state
+import diag_log
 
 
 def _build_cotp_dr(dst_ref: int, reason: int = 0x03) -> bytes:
@@ -173,8 +175,17 @@ class S7Proxy:
         # at all -- see that module's docstring for why.
         ladder_cfg = self.cfg.get("ladder_program", {})
         self.ladder_enabled = ladder_cfg.get("enabled", True)
+        # Resolve the runtime-state paths (cpu_state.json, honeypot.db) from
+        # THIS config, not from whatever config.yaml happens to be in the
+        # CWD. The proxy writes STOP/RUN transitions, so without this a
+        # proxy started with an explicit config path would record them in
+        # the wrong state dir.
+        cpu_state.configure(config_path)
+        diag_log.configure(config_path)
         self.block_store = BlockStore()
-        self.block_handler = BlockTransferHandler(self.block_store, self.cmd_logger)
+        self.block_handler = BlockTransferHandler(
+            self.block_store, self.cmd_logger,
+            cpu_state_path=cpu_state.STATE_PATH)
         self.szl_status_handler = SZLStatusHandler(self.cmd_logger)
         self.clock_handler = ClockHandler(self.cmd_logger)
         self.block_list_handler = BlockListHandler(self.block_store)

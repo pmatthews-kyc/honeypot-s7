@@ -62,6 +62,12 @@ Do this before the first start: it installs Docker, and the hardening step
 only adds the Docker firewall rules (ports 502/8080) if Docker is already
 present. It also adds a ninth unit, `s7honeypot-openplc`.
 
+When it finishes, follow the **FINISH IN THE OPENPLC UI** block it prints:
+confirm `process_sim` is uploaded and running (upload it from
+`openplc_program/process_sim.st` if not), and tick **Settings → Start OpenPLC
+in RUN mode**. The summary's *Program status* line tells you whether the
+program is already executing.
+
 ### Step 4 — Start everything
 
 **Option A — reboot (recommended).**
@@ -84,7 +90,8 @@ IP writer, hardening, SNMP, web portal and SYN-ACK spoofer stay stopped.
 #    over SSH your session may drop. Reconnect on the new address.
 sudo systemctl start s7honeypot-mac-spoof
 
-# 2. Record the current IP/MAC (SNMP + web read this). Run AFTER the IP settles.
+# 2. Record the current IP/MAC (SNMP + web read this). Waits for DHCP itself
+#    (5 s settle, then up to 90 s), so just start it and let it finish.
 sudo systemctl start s7honeypot-ip-writer
 
 # 3. Firewall/TTL/sysctl hardening — must come before the proxy and spoofer.
@@ -104,12 +111,18 @@ sudo systemctl start s7honeypot-snmp s7honeypot-web
 The boot dependency order the units enforce is:
 
 ```
-mac-spoof → (network up) → ip-writer ─┬─→ snmp
-                                      └─→ web
-            (network up) → harden ────┬─→ proxy (requires backend)
-                                      └─→ synack-spoof
-            docker → openplc ────────────→ backend → proxy
+mac-spoof ──► ip-writer ──┬──► harden ──┬──► proxy  (requires backend)
+  (sysinit,   (settles 5 s, │            └──► synack-spoof
+   before     then waits up │
+   network)   to 90 s for   ├──► backend ──► proxy
+              an IPv4 addr) ├──► snmp
+                            └──► web
+                 docker ──► openplc ──► backend
 ```
+
+Everything downstream of ip-writer uses `Wants=` + `After=`, so a slow lease
+delays the start; it never blocks it. The settle and wait times are
+`x-boot-settle-seconds` / `x-boot-ip-wait-seconds` in `config.yaml`.
 
 ### Step 5 — Confirm it's working
 
@@ -126,9 +139,9 @@ systemctl list-units 's7honeypot-*' --all --no-pager
 | Unit | Expected state | Kind |
 |---|---|---|
 | `s7honeypot-mac-spoof` | `active (exited)` | one-shot at boot |
-| `s7honeypot-ip-writer` | `active (exited)` | one-shot at boot |
+| `s7honeypot-ip-writer` | `active (exited)` | one-shot at boot; settles 5 s then waits up to 90 s for DHCP, retried by systemd if it still fails — all other units start after it |
 | `s7honeypot-harden` | `active (exited)` | one-shot at boot |
-| `s7honeypot-openplc` | `active (exited)` | one-shot (OpenPLC only) |
+| `s7honeypot-openplc` | `active (exited)` | one-shot (OpenPLC only); forces the PLC runtime into RUN and fails unless Modbus 502 is open inside the container **and** the scan counter is advancing |
 | `s7honeypot-backend` | `active (running)` | daemon |
 | `s7honeypot-proxy` | `active (running)` | daemon |
 | `s7honeypot-synack-spoof` | `active (running)` | daemon |
@@ -175,6 +188,7 @@ as `eth0`) in place of the placeholder:
 |---|---|---|
 | mangle `POSTROUTING` | `-o eth0 -p tcp … -j TTL --ttl-set 30` | TCP leaves with S7-300 TTL |
 | mangle `POSTROUTING` | `-o eth0 -p icmp … -j TTL --ttl-set 30` | `ping` shows TTL 30, not Linux's 64 |
+| mangle `POSTROUTING` | `-o eth0 -p udp … -j TTL --ttl-set 30` | SNMP replies show TTL 30 (nmap `-sU` otherwise reports `ttl 64`) |
 | filter `INPUT` | `! -i lo -p tcp --dport 1102 … -j REJECT --reject-with tcp-reset` | hides backend (nmap says *closed*) |
 | filter `OUTPUT` | `--sport 102 --tcp-flags SYN,ACK SYN,ACK … -j NFQUEUE --queue-num 42 --queue-bypass` | SYN-ACK window/options rewrite |
 | `DOCKER-USER` | `-i eth0 … --dport 502 -j REJECT` | hides OpenPLC Modbus |
@@ -228,6 +242,7 @@ python3 tools/s7_repl.py <honeypot-ip> --rack 0 --slot 2
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | A daemon is `failed` | Crash at start | `sudo journalctl -u s7honeypot-<name> -n 50 --no-pager` |
+| `openplc` failed | PLC runtime didn't start, or it started but no program is executing (`scan counter … stuck`) | `sudo journalctl -u s7honeypot-openplc -n 30`; re-upload the program — TROUBLESHOOTING §4 |
 | `proxy` failed, `backend` failed | Proxy requires backend | Fix the backend first (usually its journal shows a Python import error — see the venv rule in [TROUBLESHOOTING](docs/TROUBLESHOOTING.md#0-the-venv-rule--read-this-first)) |
 | Only `proxy` and `backend` running; others `inactive` | Started with `systemctl start s7honeypot-proxy` only | Run Step 4 Option B in full, or reboot |
 | Rules show `ens33` (or another wrong NIC), or no TTL rules | Edited config after installing | See [Changed config after installing](#changed-config-after-installing) |
@@ -235,8 +250,8 @@ python3 tools/s7_repl.py <honeypot-ip> --rack 0 --slot 2
 | `DOCKER-USER` rules missing after a reboot, others present | Hardening ran before Docker created the chain | Re-apply cleanly (see below the table) |
 | `1102`, `502` or `8080` show `filtered` from nmap | An old DROP rule is present | Re-apply cleanly (see below the table) |
 | `1102` shows `open` from nmap | Hardening not applied at all | `sudo bash /opt/s7honeypot/deploy/fingerprint_harden.sh apply`, then re-check 5c |
-| JSON IP/MAC doesn't match `ip addr` | IP changed after the MAC spoof | `sudo systemctl restart s7honeypot-ip-writer` |
-| `ping` shows `ttl=64` | ICMP TTL rule missing or on wrong NIC | Check 5c; if the NIC is wrong, see [Changed config after installing](#changed-config-after-installing) |
+| JSON IP/MAC doesn't match `ip addr`, or `network_state.json` is missing | IP changed after the MAC spoof, or DHCP took longer than ip-writer's wait | `sudo systemctl restart s7honeypot-ip-writer` (snmp/web keep running meanwhile; they re-read the file on each request) |
+| `ping` shows `ttl=64`, or nmap `-sU` shows `ttl 64` on 161 | ICMP/UDP TTL rule missing or on wrong NIC | Check 5c; if the NIC is wrong, see [Changed config after installing](#changed-config-after-installing) |
 | `ip -6 addr` shows addresses | Hardening not applied, or reverted | Check 5c; if rules are missing, `fingerprint_harden.sh apply` |
 | `s7-info` shows library default identity | Backend not reading your config | `sudo journalctl -u s7honeypot-backend \| grep "Identity patch"` |
 

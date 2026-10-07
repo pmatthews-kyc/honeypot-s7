@@ -109,13 +109,18 @@ apply() {
     # leaving on the honeypot NIC, covering TCP (the S7/web/SNMP services)
     # AND ICMP (so `ping` shows TTL 30, not the Linux 64 — otherwise the
     # echo reply, which doesn't originate from port 102, would leak Linux).
-    echo "[*] Rewriting outbound TTL to ${TARGET_TTL} on ${IFACE} (TCP + ICMP)..."
+    echo "[*] Rewriting outbound TTL to ${TARGET_TTL} on ${IFACE} (TCP + ICMP + UDP)..."
     iptables -t mangle -A POSTROUTING -o "${IFACE}" -p tcp \
         -j TTL --ttl-set "${TARGET_TTL}" \
         -m comment --comment "${MANGLE_COMMENT}-ttl-tcp"
     iptables -t mangle -A POSTROUTING -o "${IFACE}" -p icmp \
         -j TTL --ttl-set "${TARGET_TTL}" \
         -m comment --comment "${MANGLE_COMMENT}-ttl-icmp"
+    # UDP too: SNMP replies otherwise leave with the Linux TTL (64) while
+    # TCP and ICMP show 30 -- a mismatch no real device produces.
+    iptables -t mangle -A POSTROUTING -o "${IFACE}" -p udp \
+        -j TTL --ttl-set "${TARGET_TTL}" \
+        -m comment --comment "${MANGLE_COMMENT}-ttl-udp"
 
     # ── Disable IPv6 ────────────────────────────────────────────────────
     # A real S7-300 (CPU 315-2 PN/DP and its generation) is IPv4-only — its
@@ -188,12 +193,10 @@ apply() {
 
     cat <<EOF
 
-[!] Reminder: these changes are NOT persistent across reboot.
-    Either:
-      - install iptables-persistent and run: netfilter-persistent save
-      - or call this script from a systemd unit / @reboot cron entry
-    And re-run 'sysctl -w' values on boot too (or add them to
-    /etc/sysctl.d/99-s7honeypot-fingerprint.conf).
+[*] Persistence: s7honeypot-harden.service (enabled by install.sh) re-runs
+    this apply at every boot. If you manage the rules yourself, disable
+    that unit and persist them with netfilter-persistent plus a
+    /etc/sysctl.d drop-in instead.
 
 [!] VERIFY the backend isolation actually matters on your setup:
     sudo ss -tlnp | grep ${BACKEND_PORT}
@@ -247,7 +250,7 @@ revert() {
 
     # Remove the scoped TTL mangle rules (TCP + ICMP)
     echo "[*] Removing TTL rewrite rules..."
-    for proto in tcp icmp; do
+    for proto in tcp icmp udp; do
         while iptables -t mangle -C POSTROUTING -o "${IFACE}" -p "${proto}" \
             -j TTL --ttl-set "${TARGET_TTL}" \
             -m comment --comment "${MANGLE_COMMENT}-ttl-${proto}" 2>/dev/null; do
@@ -296,7 +299,7 @@ status() {
     echo "--- IPv6 (should be disabled: 1) ---"
     sysctl net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo "(IPv6 sysctl unavailable)"
     echo
-    echo "--- TTL rewrite (should show ttl-set ${TARGET_TTL} for tcp + icmp) ---"
+    echo "--- TTL rewrite (should show ttl-set ${TARGET_TTL} for tcp + icmp + udp) ---"
     iptables -t mangle -L POSTROUTING -n -v | grep "TTL set" || echo "(no TTL rules applied)"
 }
 
