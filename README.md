@@ -90,6 +90,7 @@ design rationale.
 ---
 
 ## Quick start
+Tested on Debian 13 and OrangePI Debian/
 
 On a Debian-based Raspberry Pi (or similar SBC):
 
@@ -155,51 +156,7 @@ through `paths.py`, so readers and writers can't disagree. **Change the
 `serial_number` before deploying**: a shared serial across copies would itself
 become a fingerprint identifying the deployment as this honeypot.
 
----
-
-## How it compares to Conpot / ICSpot
-
-This is **not** a claim of general superiority — Conpot and ICSpot are mature,
-community-maintained, and broader in protocol coverage. Where this project
-differs:
-
-- **Built for reconstruction, not just detection.** The capture pipeline
-  produces a per-session pcap and a raw-hex-inclusive JSONL log keyed by
-  session, oriented around rebuilding exactly what was sent — not just
-  alerting that something happened.
-- **Signal-filtered.** A valid TPKT+COTP handshake is required before a
-  session is captured, cutting generic internet scan noise. The filter's
-  limits are stated honestly (it can't distinguish a targeted attacker from
-  an S7-aware fuzzer — that's post-hoc log analysis).
-- **Fingerprint depth past the application layer, out of the box.** TCP-stack
-  hardening, a dynamic-IP-aware SNMP agent, MAC spoofed to a real Siemens OUI,
-  and library-tell patching (COTP, PDU size) ship as part of the base project.
-- **Config-driven identity**, cross-consistent across four surfaces.
-
-Where the public projects are still ahead: years of production deployment,
-broader protocol coverage, and — for ICSpot — a peer-reviewed measurement of
-its realism against real scanners.
-
----
-
-## Testing
-
-```bash
-cd tests
-# Run standalone (no extra deps — the tests are plain asserts):
-for t in test_*.py; do python3 "$t"; done
-# Or with pytest, if installed (venv/bin/pip install pytest):
-python3 -m pytest
-```
-
-20 test modules cover BER/ASN.1 round-tripping, S7 frame parse/build
-(including fragmented TCP segments), SZL identity byte layouts, the COTP/PDU
-patches, block transfer, the diagnostic-buffer safety filter, and the web
-portal — run against real logic, not mocks.
-
-A client REPL for manual exercise is in [`tools/s7_repl.py`](tools/s7_repl.py).
-
----
+-----
 
 ## Validation status
 
